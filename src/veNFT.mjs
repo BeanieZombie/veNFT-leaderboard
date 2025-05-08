@@ -1,6 +1,6 @@
 import { createPublicClient, formatUnits, http, webSocket } from "viem";
 import { parseAbiItem } from "viem";
-import { 
+import {
   arbitrum,
   bsc,
   canto,
@@ -58,12 +58,12 @@ export const cantoPublicClient = createPublicClient({
 
 export const fantomPublicClient = createPublicClient({
   chain: fantom,
-  transport: http("https://fantom.drpc.org"),
+  transport: http("https://fantom-pokt.nodies.app"),
 });
 
 export const sonicPublicClient = createPublicClient({
   chain: sonic,
-  transport: http("https://sonic.drpc.org"),
+  transport: http("https://sonic-rpc.publicnode.com:443"),
 });
 
 export const optimismPublicClient = createPublicClient({
@@ -147,7 +147,12 @@ async function getMaxNFTId(
     console.log(`Retrying in 10 seconds...`);
     await new Promise((resolve) => setTimeout(resolve, 10000));
     // Reduce chunk size to handle potential RPC limitations
-    return await getMaxNFTId(publicClient, veContractAddress, chunkSize / 2n, toBlock);
+    return await getMaxNFTId(
+      publicClient,
+      veContractAddress,
+      chunkSize / 2n,
+      toBlock
+    );
   }
 }
 
@@ -232,6 +237,120 @@ export async function getNFTs(
         // influence
         value.reduce((acc, obj) => acc + Number(obj.balance), 0) /
           Number(formatUnits(totalSupply, 18)),
+        value,
+      ]);
+      return acc;
+    }, []);
+}
+
+export async function getChunkedNFTs(
+  publicClient,
+  veContractAddress,
+  chunkSize = 10000n,
+  excludeAddresses = []
+) {
+  const t0 = performance.now();
+
+  const maxNFTId = await getMaxNFTId(
+    publicClient,
+    veContractAddress,
+    chunkSize
+  );
+
+  const t1 = performance.now();
+  console.log(`getMaxNFTId took ${t1 - t0}ms`);
+  console.log("maxNFTId", maxNFTId);
+  // generate a multicall with all the calls you want to make
+  // generate an array of maxNFTNumber length, and fill with number beginning at 1
+  const nfts = [...Array(maxNFTId).keys()].map((nft) => nft + 1);
+  // .filter((nft) => !excludeNFTIds.includes(nft));
+
+  // velodrome has huge maxNFTId > 25k, which means it will take a long time to get all the balances
+  const [totalSupply, ...balances] = await publicClient.multicall({
+    contracts: [
+      {
+        address: veContractAddress,
+        abi: abi,
+        functionName: "totalSupply",
+        args: [],
+      },
+      ...nfts.map((nft) => ({
+        address: veContractAddress,
+        abi: abi,
+        functionName: "balanceOfNFT",
+        args: [nft],
+      })),
+    ],
+    allowFailure: false,
+  });
+
+  const t2 = performance.now();
+  console.log(`multicall balances took ${t2 - t1}ms`);
+
+  const owners = (
+    await publicClient.multicall({
+      contracts: nfts.map((nft) => ({
+        address: veContractAddress,
+        abi: abi,
+        functionName: "ownerOf",
+        args: [nft],
+      })),
+      allowFailure: false,
+    })
+  ).map((owner) => owner.toLowerCase());
+
+  // .map((owner) => owner.toLowerCase());
+
+  const t3 = performance.now();
+  console.log(`multicall owners took ${t3 - t2}ms`);
+
+  // 1. find the excluded address NFTs and calculate their total balance
+  const excludedNFTs = nfts.filter((nft) =>
+    excludeAddresses
+      .map((address) => address.toLowerCase())
+      .includes(owners[nft - 1])
+  );
+  const excludedNFTsBalance = excludedNFTs.reduce(
+    (acc, nft) => acc + Number(balances[nft - 1]),
+    0
+  );
+
+  // adjust the total supply by the excluded NFTs balance
+  const adjustedTotalSupply = totalSupply - BigInt(excludedNFTsBalance);
+
+  const data = nfts
+    .map((nft, index) => ({
+      id: nft,
+      balance: formatUnits(balances[index], 18),
+      owner: owners[index],
+    }))
+    .reduce((acc, obj) => {
+      acc[obj.owner] = acc[obj.owner] || [];
+      acc[obj.owner].push(obj);
+      return acc;
+    }, {});
+
+  // data should be filtered AFTER it has been gathered across the different data sources
+
+  for (let index = 0; index < excludeAddresses.length; index++) {
+    const address = excludeAddresses[index];
+    delete data[address];
+  }
+
+  return Object.entries(data)
+    .sort((a, b) => {
+      const aTotal = a[1].reduce((acc, obj) => acc + Number(obj.balance), 0);
+      const bTotal = b[1].reduce((acc, obj) => acc + Number(obj.balance), 0);
+      return bTotal - aTotal;
+    })
+    .reduce((acc, [key, value]) => {
+      acc.push([
+        key,
+        // sum all balances
+        value.reduce((acc, obj) => acc + Number(obj.balance), 0),
+        // influence
+        value.reduce((acc, obj) => acc + Number(obj.balance), 0) /
+          Number(formatUnits(adjustedTotalSupply, 18)),
         value,
       ]);
       return acc;
